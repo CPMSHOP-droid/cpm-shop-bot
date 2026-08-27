@@ -1,4 +1,6 @@
 import os
+import json
+
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -24,6 +26,24 @@ PREMIUM1_PASSWORD = os.getenv("PREMIUM1_PASSWORD")
 PREMIUM_PRICE = 500
 RESOURCES_PRICE = 200
 
+STOCK_FILE = "stock.json"
+
+
+def load_stock():
+    if not os.path.exists(STOCK_FILE):
+        return {"premium1_sold": False}
+
+    try:
+        with open(STOCK_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {"premium1_sold": False}
+
+
+def save_stock(stock):
+    with open(STOCK_FILE, "w") as f:
+        json.dump(stock, f)
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
@@ -48,14 +68,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def button_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
+    stock = load_stock()
+
     if query.data == "premium":
+
+        if stock["premium1_sold"]:
+            await query.message.reply_text(
+                "❌ PREMIUM ACCOUNT\n\n"
+                "📦 Currently out of stock."
+            )
+            return
+
         keyboard = [[
             InlineKeyboardButton(
                 "💳 BUY FOR 500 ⭐",
@@ -86,6 +113,13 @@ async def button_handler(
         )
 
     elif query.data == "buy_premium":
+
+        if stock["premium1_sold"]:
+            await query.message.reply_text(
+                "❌ This account has already been sold."
+            )
+            return
+
         if not PREMIUM1_LOGIN or not PREMIUM1_PASSWORD:
             await query.message.reply_text(
                 "❌ Product is temporarily unavailable."
@@ -99,7 +133,10 @@ async def button_handler(
             payload="premium_1",
             currency="XTR",
             prices=[
-                LabeledPrice("Premium Account", PREMIUM_PRICE)
+                LabeledPrice(
+                    "Premium Account",
+                    PREMIUM_PRICE
+                )
             ],
         )
 
@@ -109,9 +146,17 @@ async def precheckout_callback(
     context: ContextTypes.DEFAULT_TYPE
 ):
     query = update.pre_checkout_query
+    stock = load_stock()
 
     if query.invoice_payload != "premium_1":
         await query.answer(ok=False)
+        return
+
+    if stock["premium1_sold"]:
+        await query.answer(
+            ok=False,
+            error_message="This account has already been sold."
+        )
         return
 
     await query.answer(ok=True)
@@ -126,8 +171,21 @@ async def successful_payment(
     if payment.invoice_payload != "premium_1":
         return
 
+    stock = load_stock()
+
+    if stock["premium1_sold"]:
+        await update.message.reply_text(
+            "⚠️ This account is already marked as sold. "
+            "Please contact support."
+        )
+        return
+
     login = PREMIUM1_LOGIN
     password = PREMIUM1_PASSWORD
+
+    # Mark account as sold BEFORE sending the credentials.
+    stock["premium1_sold"] = True
+    save_stock(stock)
 
     await update.message.reply_text(
         "✅ PAYMENT SUCCESSFUL!\n\n"
@@ -146,8 +204,13 @@ async def owner(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    stock = load_stock()
+
+    status = "❌ SOLD" if stock["premium1_sold"] else "🟢 AVAILABLE"
+
     await update.message.reply_text(
-        "👑 Owner access confirmed."
+        f"👑 OWNER PANEL\n\n"
+        f"💎 Premium #1: {status}"
     )
 
 
