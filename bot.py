@@ -1,11 +1,13 @@
 import os
 import psycopg
+
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     LabeledPrice,
     Update,
 )
+
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -16,6 +18,11 @@ from telegram.ext import (
     filters,
 )
 
+
+# =========================================================
+# SETTINGS
+# =========================================================
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -25,22 +32,27 @@ PREMIUM1_PASSWORD = os.getenv("PREMIUM1_PASSWORD")
 
 PREMIUM_PRICE = 500
 RESOURCES_PRICE = 200
+SUPPORT_PRICE = 10
 
 
-# =========================
+# =========================================================
 # DATABASE
-# =========================
+# =========================================================
 
 def get_connection():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is not set.")
+
     return psycopg.connect(DATABASE_URL)
 
 
 def init_database():
+
     with get_connection() as conn:
+
         with conn.cursor() as cur:
 
+            # Existing table is preserved.
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS premium_accounts (
                     id SERIAL PRIMARY KEY,
@@ -53,6 +65,21 @@ def init_database():
                 )
             """)
 
+            # Add product type if it doesn't exist.
+            cur.execute("""
+                ALTER TABLE premium_accounts
+                ADD COLUMN IF NOT EXISTS product_type TEXT
+                DEFAULT 'premium'
+            """)
+
+            # Existing accounts remain Premium accounts.
+            cur.execute("""
+                UPDATE premium_accounts
+                SET product_type = 'premium'
+                WHERE product_type IS NULL
+            """)
+
+            # Add the first account only if the database is empty.
             cur.execute("""
                 SELECT COUNT(*)
                 FROM premium_accounts
@@ -60,43 +87,70 @@ def init_database():
 
             count = cur.fetchone()[0]
 
-            if count == 0 and PREMIUM1_LOGIN and PREMIUM1_PASSWORD:
+            if (
+                count == 0
+                and PREMIUM1_LOGIN
+                and PREMIUM1_PASSWORD
+            ):
+
                 cur.execute(
                     """
                     INSERT INTO premium_accounts
-                    (login, password)
-                    VALUES (%s, %s)
+                    (
+                        login,
+                        password,
+                        product_type
+                    )
+                    VALUES (%s, %s, 'premium')
                     """,
                     (
                         PREMIUM1_LOGIN,
-                        PREMIUM1_PASSWORD
+                        PREMIUM1_PASSWORD,
                     ),
                 )
 
         conn.commit()
 
 
-def get_available_account():
+# =========================================================
+# ACCOUNT FUNCTIONS
+# =========================================================
+
+def get_available_account(product_type):
+
     with get_connection() as conn:
+
         with conn.cursor() as cur:
 
             cur.execute("""
-                SELECT id, login, password
+                SELECT
+                    id,
+                    login,
+                    password
                 FROM premium_accounts
-                WHERE sold = FALSE
+                WHERE
+                    sold = FALSE
+                    AND product_type = %s
                 ORDER BY id
                 LIMIT 1
-            """)
+            """, (product_type,))
 
             return cur.fetchone()
 
 
 def get_account_by_id(account_id):
+
     with get_connection() as conn:
+
         with conn.cursor() as cur:
 
             cur.execute("""
-                SELECT id, login, password, sold
+                SELECT
+                    id,
+                    login,
+                    password,
+                    sold,
+                    product_type
                 FROM premium_accounts
                 WHERE id = %s
             """, (account_id,))
@@ -107,80 +161,121 @@ def get_account_by_id(account_id):
 def mark_account_sold(account_id, user_id):
 
     with get_connection() as conn:
+
         with conn.cursor() as cur:
 
             cur.execute("""
                 UPDATE premium_accounts
-                SET sold = TRUE,
+
+                SET
+                    sold = TRUE,
                     sold_to = %s,
                     sold_at = CURRENT_TIMESTAMP
-                WHERE id = %s
-                  AND sold = FALSE
-                RETURNING login, password
+
+                WHERE
+                    id = %s
+                    AND sold = FALSE
+
+                RETURNING
+                    login,
+                    password,
+                    product_type
             """, (
                 user_id,
-                account_id
+                account_id,
             ))
 
             result = cur.fetchone()
 
-            conn.commit()
+        conn.commit()
 
-            return result
+        return result
 
 
-def get_stock_count():
+def get_stock_count(product_type):
 
     with get_connection() as conn:
+
         with conn.cursor() as cur:
 
             cur.execute("""
                 SELECT COUNT(*)
                 FROM premium_accounts
-                WHERE sold = FALSE
-            """)
+                WHERE
+                    sold = FALSE
+                    AND product_type = %s
+            """, (product_type,))
 
             return cur.fetchone()[0]
 
 
-def get_sold_count():
+def get_sold_count(product_type=None):
 
     with get_connection() as conn:
+
         with conn.cursor() as cur:
 
-            cur.execute("""
-                SELECT COUNT(*)
-                FROM premium_accounts
-                WHERE sold = TRUE
-            """)
+            if product_type:
+
+                cur.execute("""
+                    SELECT COUNT(*)
+                    FROM premium_accounts
+                    WHERE
+                        sold = TRUE
+                        AND product_type = %s
+                """, (product_type,))
+
+            else:
+
+                cur.execute("""
+                    SELECT COUNT(*)
+                    FROM premium_accounts
+                    WHERE sold = TRUE
+                """)
 
             return cur.fetchone()[0]
 
 
-def get_total_count():
+def get_total_count(product_type=None):
 
     with get_connection() as conn:
+
         with conn.cursor() as cur:
 
-            cur.execute("""
-                SELECT COUNT(*)
-                FROM premium_accounts
-            """)
+            if product_type:
+
+                cur.execute("""
+                    SELECT COUNT(*)
+                    FROM premium_accounts
+                    WHERE product_type = %s
+                """, (product_type,))
+
+            else:
+
+                cur.execute("""
+                    SELECT COUNT(*)
+                    FROM premium_accounts
+                """)
 
             return cur.fetchone()[0]
 
 
-def get_stock_accounts():
+def get_stock_accounts(product_type):
 
     with get_connection() as conn:
+
         with conn.cursor() as cur:
 
             cur.execute("""
-                SELECT id, login
+                SELECT
+                    id,
+                    login
                 FROM premium_accounts
-                WHERE sold = FALSE
+                WHERE
+                    sold = FALSE
+                    AND product_type = %s
                 ORDER BY id
-            """)
+            """, (product_type,))
 
             return cur.fetchall()
 
@@ -188,10 +283,16 @@ def get_stock_accounts():
 def get_recent_sales():
 
     with get_connection() as conn:
+
         with conn.cursor() as cur:
 
             cur.execute("""
-                SELECT id, login, sold_to, sold_at
+                SELECT
+                    id,
+                    login,
+                    sold_to,
+                    sold_at,
+                    product_type
                 FROM premium_accounts
                 WHERE sold = TRUE
                 ORDER BY sold_at DESC
@@ -201,20 +302,29 @@ def get_recent_sales():
             return cur.fetchall()
 
 
-def add_account(login, password):
+def add_account(login, password, product_type):
 
     with get_connection() as conn:
+
         with conn.cursor() as cur:
 
-            cur.execute("""
+            cur.execute(
+                """
                 INSERT INTO premium_accounts
-                (login, password)
-                VALUES (%s, %s)
+                (
+                    login,
+                    password,
+                    product_type
+                )
+                VALUES (%s, %s, %s)
                 RETURNING id
-            """, (
-                login,
-                password
-            ))
+                """,
+                (
+                    login,
+                    password,
+                    product_type,
+                ),
+            )
 
             account_id = cur.fetchone()[0]
 
@@ -226,12 +336,16 @@ def add_account(login, password):
 def delete_account(account_id):
 
     with get_connection() as conn:
+
         with conn.cursor() as cur:
 
             cur.execute("""
                 DELETE FROM premium_accounts
-                WHERE id = %s
-                  AND sold = FALSE
+
+                WHERE
+                    id = %s
+                    AND sold = FALSE
+
                 RETURNING id
             """, (account_id,))
 
@@ -242,9 +356,9 @@ def delete_account(account_id):
         return result
 
 
-# =========================
-# OWNER
-# =========================
+# =========================================================
+# OWNER SECURITY
+# =========================================================
 
 def is_owner(update):
 
@@ -253,6 +367,10 @@ def is_owner(update):
         and update.effective_user.id == OWNER_ID
     )
 
+
+# =========================================================
+# OWNER KEYBOARD
+# =========================================================
 
 def owner_keyboard():
 
@@ -301,6 +419,10 @@ def owner_keyboard():
     ])
 
 
+# =========================================================
+# OWNER PANEL
+# =========================================================
+
 async def owner(update, context):
 
     if not is_owner(update):
@@ -311,20 +433,36 @@ async def owner(update, context):
 
         return
 
+    premium_stock = get_stock_count("premium")
+    resources_stock = get_stock_count("resources")
+
+    premium_sold = get_sold_count("premium")
+    resources_sold = get_sold_count("resources")
+
+    total_sold = premium_sold + resources_sold
+
     await update.message.reply_text(
 
         "👑 OWNER PANEL\n\n"
 
-        f"📦 Stock: {get_stock_count()}\n"
+        "💎 PREMIUM ACCOUNT\n"
+        f"📦 Stock: {premium_stock}\n"
+        f"✅ Sold: {premium_sold}\n\n"
 
-        f"✅ Sold: {get_sold_count()}\n"
+        "⭐ PREMIUM RESOURCES\n"
+        f"📦 Stock: {resources_stock}\n"
+        f"✅ Sold: {resources_sold}\n\n"
 
-        f"📊 Total: {get_total_count()}",
+        f"📊 TOTAL SOLD: {total_sold}",
 
         reply_markup=owner_keyboard(),
 
     )
 
+
+# =========================================================
+# OWNER BUTTONS
+# =========================================================
 
 async def owner_panel_callback(update, context):
 
@@ -338,42 +476,79 @@ async def owner_panel_callback(update, context):
     data = query.data
 
 
+    # -----------------------------------------------------
+    # REFRESH
+    # -----------------------------------------------------
+
     if data == "owner_refresh":
+
+        premium_stock = get_stock_count("premium")
+        resources_stock = get_stock_count("resources")
+
+        premium_sold = get_sold_count("premium")
+        resources_sold = get_sold_count("resources")
+
+        total_sold = premium_sold + resources_sold
 
         await query.edit_message_text(
 
             "👑 OWNER PANEL\n\n"
 
-            f"📦 Stock: {get_stock_count()}\n"
+            "💎 PREMIUM ACCOUNT\n"
+            f"📦 Stock: {premium_stock}\n"
+            f"✅ Sold: {premium_sold}\n\n"
 
-            f"✅ Sold: {get_sold_count()}\n"
+            "⭐ PREMIUM RESOURCES\n"
+            f"📦 Stock: {resources_stock}\n"
+            f"✅ Sold: {resources_sold}\n\n"
 
-            f"📊 Total: {get_total_count()}",
+            f"📊 TOTAL SOLD: {total_sold}",
 
             reply_markup=owner_keyboard(),
 
         )
 
 
+    # -----------------------------------------------------
+    # STOCK
+    # -----------------------------------------------------
+
     elif data == "owner_stock":
 
-        accounts = get_stock_accounts()
-
-        if not accounts:
-
-            await query.message.reply_text(
-                "📦 STOCK\n\n❌ Stock is empty."
-            )
-
-            return
+        premium = get_stock_accounts("premium")
+        resources = get_stock_accounts("resources")
 
         text = "📦 STOCK\n\n"
 
-        for account_id, login in accounts:
+        text += "💎 PREMIUM ACCOUNT\n"
 
-            text += (
-                f"🟢 #{account_id} — `{login}`\n"
-            )
+        if premium:
+
+            for account_id, login in premium:
+
+                text += (
+                    f"🟢 #{account_id} — `{login}`\n"
+                )
+
+        else:
+
+            text += "❌ Empty\n"
+
+
+        text += "\n⭐ PREMIUM RESOURCES\n"
+
+        if resources:
+
+            for account_id, login in resources:
+
+                text += (
+                    f"🟢 #{account_id} — `{login}`\n"
+                )
+
+        else:
+
+            text += "❌ Empty\n"
+
 
         await query.message.reply_text(
             text,
@@ -381,13 +556,23 @@ async def owner_panel_callback(update, context):
         )
 
 
+    # -----------------------------------------------------
+    # STATISTICS
+    # -----------------------------------------------------
+
     elif data == "owner_stats":
 
-        stock = get_stock_count()
+        premium_stock = get_stock_count("premium")
+        resources_stock = get_stock_count("resources")
 
-        sold = get_sold_count()
+        premium_sold = get_sold_count("premium")
+        resources_sold = get_sold_count("resources")
 
-        total = get_total_count()
+        premium_total = get_total_count("premium")
+        resources_total = get_total_count("resources")
+
+        total = premium_total + resources_total
+        sold = premium_sold + resources_sold
 
         percentage = 0
 
@@ -402,16 +587,26 @@ async def owner_panel_callback(update, context):
 
             "📊 STATISTICS\n\n"
 
-            f"📦 Available: {stock}\n"
+            "💎 PREMIUM ACCOUNT\n"
+            f"📦 Available: {premium_stock}\n"
+            f"✅ Sold: {premium_sold}\n"
+            f"📊 Total: {premium_total}\n\n"
 
-            f"✅ Sold: {sold}\n"
+            "⭐ PREMIUM RESOURCES\n"
+            f"📦 Available: {resources_stock}\n"
+            f"✅ Sold: {resources_sold}\n"
+            f"📊 Total: {resources_total}\n\n"
 
-            f"📊 Total: {total}\n"
-
+            f"📈 Total sold: {sold}\n"
+            f"📊 Total accounts: {total}\n"
             f"📈 Sold percentage: {percentage}%"
 
         )
 
+
+    # -----------------------------------------------------
+    # SALES
+    # -----------------------------------------------------
 
     elif data == "owner_sales":
 
@@ -420,18 +615,34 @@ async def owner_panel_callback(update, context):
         if not sales:
 
             await query.message.reply_text(
-                "📈 SALES\n\nNo sales yet."
+
+                "📈 SALES\n\n"
+                "No sales yet."
+
             )
 
             return
 
         text = "📈 LAST 10 SALES\n\n"
 
-        for account_id, login, sold_to, sold_at in sales:
+        for (
+            account_id,
+            login,
+            sold_to,
+            sold_at,
+            product_type
+        ) in sales:
+
+            if product_type == "premium":
+                product_name = "💎 Premium Account"
+            else:
+                product_name = "⭐ Premium Resources"
 
             text += (
 
-                f"💎 #{account_id}\n"
+                f"{product_name}\n"
+
+                f"🆔 #{account_id}\n"
 
                 f"👤 Login: `{login}`\n"
 
@@ -447,33 +658,67 @@ async def owner_panel_callback(update, context):
         )
 
 
+    # -----------------------------------------------------
+    # ADD ACCOUNT
+    # -----------------------------------------------------
+
     elif data == "owner_add":
 
         context.user_data.clear()
 
-        context.user_data["adding_account"] = True
+        context.user_data[
+            "adding_account"
+        ] = True
 
-        context.user_data["add_step"] = "login"
+        context.user_data[
+            "add_step"
+        ] = "product"
 
         await query.message.reply_text(
 
-            "➕ ADD PREMIUM ACCOUNT\n\n"
+            "➕ ADD ACCOUNT\n\n"
 
-            "👤 Send the account LOGIN:"
+            "Choose account type:",
+
+            reply_markup=InlineKeyboardMarkup([
+
+                [
+
+                    InlineKeyboardButton(
+                        "💎 PREMIUM — 500 ⭐",
+                        callback_data="add_product_premium"
+                    )
+
+                ],
+
+                [
+
+                    InlineKeyboardButton(
+                        "⭐ RESOURCES — 200 ⭐",
+                        callback_data="add_product_resources"
+                    )
+
+                ],
+
+            ])
 
         )
 
 
+    # -----------------------------------------------------
+    # DELETE ACCOUNT
+    # -----------------------------------------------------
+
     elif data == "owner_delete":
 
-        accounts = get_stock_accounts()
+        premium = get_stock_accounts("premium")
+        resources = get_stock_accounts("resources")
 
-        if not accounts:
+        if not premium and not resources:
 
             await query.message.reply_text(
 
                 "🗑️ DELETE ACCOUNT\n\n"
-
                 "❌ Stock is empty."
 
             )
@@ -483,32 +728,104 @@ async def owner_panel_callback(update, context):
         text = (
 
             "🗑️ DELETE ACCOUNT\n\n"
-
-            "Send the ID of the account you want to delete.\n\n"
+            "Send the ID of the account to delete.\n\n"
 
         )
 
-        for account_id, login in accounts:
+        if premium:
 
-            text += (
-                f"#{account_id} — `{login}`\n"
-            )
+            text += "💎 PREMIUM\n"
+
+            for account_id, login in premium:
+
+                text += (
+                    f"#{account_id} — `{login}`\n"
+                )
+
+            text += "\n"
+
+
+        if resources:
+
+            text += "⭐ RESOURCES\n"
+
+            for account_id, login in resources:
+
+                text += (
+                    f"#{account_id} — `{login}`\n"
+                )
+
 
         context.user_data.clear()
 
-        context.user_data["deleting_account"] = True
+        context.user_data[
+            "deleting_account"
+        ] = True
 
         await query.message.reply_text(
+
             text,
+
             parse_mode="Markdown"
+
         )
 
 
-# =========================
-# OWNER TEXT INPUT
-# =========================
+# =========================================================
+# OWNER PRODUCT SELECTION
+# =========================================================
 
-async def owner_text_handler(update, context):
+async def owner_product_callback(
+    update,
+    context
+):
+
+    query = update.callback_query
+
+    await query.answer()
+
+    if not is_owner(update):
+        return
+
+    if not context.user_data.get(
+        "adding_account"
+    ):
+        return
+
+    if query.data == "add_product_premium":
+
+        context.user_data[
+            "new_product"
+        ] = "premium"
+
+    elif query.data == "add_product_resources":
+
+        context.user_data[
+            "new_product"
+        ] = "resources"
+
+    else:
+        return
+
+    context.user_data[
+        "add_step"
+    ] = "login"
+
+    await query.message.reply_text(
+
+        "👤 Send the account LOGIN:"
+
+    )
+
+
+# =========================================================
+# OWNER TEXT INPUT
+# =========================================================
+
+async def owner_text_handler(
+    update,
+    context
+):
 
     if not is_owner(update):
         return
@@ -516,19 +833,33 @@ async def owner_text_handler(update, context):
     text = update.message.text.strip()
 
 
-    if context.user_data.get("adding_account"):
+    # -----------------------------------------------------
+    # ADD ACCOUNT
+    # -----------------------------------------------------
 
-        step = context.user_data.get("add_step")
+    if context.user_data.get(
+        "adding_account"
+    ):
+
+        step = context.user_data.get(
+            "add_step"
+        )
 
 
         if step == "login":
 
-            context.user_data["new_login"] = text
+            context.user_data[
+                "new_login"
+            ] = text
 
-            context.user_data["add_step"] = "password"
+            context.user_data[
+                "add_step"
+            ] = "password"
 
             await update.message.reply_text(
+
                 "🔐 Send the account PASSWORD:"
+
             )
 
             return
@@ -536,26 +867,45 @@ async def owner_text_handler(update, context):
 
         if step == "password":
 
-            login = context.user_data["new_login"]
+            login = context.user_data[
+                "new_login"
+            ]
 
             password = text
 
+            product = context.user_data[
+                "new_product"
+            ]
+
             account_id = add_account(
                 login,
-                password
+                password,
+                product
             )
 
             context.user_data.clear()
+
+            if product == "premium":
+
+                product_name = "💎 Premium Account"
+
+            else:
+
+                product_name = "⭐ Premium Resources"
+
 
             await update.message.reply_text(
 
                 "✅ ACCOUNT ADDED!\n\n"
 
+                f"{product_name}\n"
+
                 f"🆔 ID: #{account_id}\n"
 
                 f"👤 Login: `{login}`\n"
 
-                f"📦 Current stock: {get_stock_count()}",
+                f"📦 Current stock: "
+                f"{get_stock_count(product)}",
 
                 parse_mode="Markdown"
 
@@ -564,7 +914,13 @@ async def owner_text_handler(update, context):
             return
 
 
-    if context.user_data.get("deleting_account"):
+    # -----------------------------------------------------
+    # DELETE ACCOUNT
+    # -----------------------------------------------------
+
+    if context.user_data.get(
+        "deleting_account"
+    ):
 
         try:
 
@@ -573,13 +929,18 @@ async def owner_text_handler(update, context):
         except ValueError:
 
             await update.message.reply_text(
-                "❌ Invalid ID. Send a number."
+
+                "❌ Invalid ID.\n"
+                "Send a number."
+
             )
 
             return
 
 
-        result = delete_account(account_id)
+        result = delete_account(
+            account_id
+        )
 
         context.user_data.clear()
 
@@ -587,7 +948,10 @@ async def owner_text_handler(update, context):
         if result is None:
 
             await update.message.reply_text(
-                "❌ Account not found or already sold."
+
+                "❌ Account not found "
+                "or already sold."
+
             )
 
             return
@@ -595,40 +959,45 @@ async def owner_text_handler(update, context):
 
         await update.message.reply_text(
 
-            f"🗑️ Account #{account_id} deleted successfully.\n\n"
-
-            f"📦 Current stock: {get_stock_count()}"
+            f"🗑️ Account #{account_id} "
+            "deleted successfully."
 
         )
 
 
-# =========================
-# USER MENU
-# =========================
+# =========================================================
+# START
+# =========================================================
 
 async def start(update, context):
 
     keyboard = [
 
         [
+
             InlineKeyboardButton(
                 "💎 PREMIUM — 500 ⭐",
                 callback_data="premium"
             )
+
         ],
 
         [
+
             InlineKeyboardButton(
                 "⭐ PREMIUM RESOURCES — 200 ⭐",
                 callback_data="resources"
             )
+
         ],
 
         [
+
             InlineKeyboardButton(
-                "❤️ SUPPORT",
+                "❤️ SUPPORT — 10 ⭐",
                 callback_data="support"
             )
+
         ],
 
     ]
@@ -639,33 +1008,42 @@ async def start(update, context):
 
         "Choose the product you want to purchase:",
 
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        reply_markup=InlineKeyboardMarkup(
+            keyboard
+        ),
 
     )
 
 
-# =========================
+# =========================================================
 # USER BUTTONS
-# =========================
+# =========================================================
 
-async def button_handler(update, context):
+async def button_handler(
+    update,
+    context
+):
 
     query = update.callback_query
 
     await query.answer()
 
 
+    # =====================================================
+    # PREMIUM
+    # =====================================================
+
     if query.data == "premium":
 
-        stock = get_stock_count()
-
+        stock = get_stock_count(
+            "premium"
+        )
 
         if stock <= 0:
 
             await query.message.reply_text(
 
                 "❌ PREMIUM ACCOUNT\n\n"
-
                 "📦 Currently out of stock."
 
             )
@@ -691,7 +1069,8 @@ async def button_handler(update, context):
 
                         "👀 PREMIUM ACCOUNT OVERVIEW",
 
-                        callback_data="premium_overview"
+                        callback_data=
+                        "premium_overview"
 
                     )
 
@@ -702,22 +1081,40 @@ async def button_handler(update, context):
         )
 
 
+    # =====================================================
+    # PREMIUM OVERVIEW
+    # =====================================================
+
     elif query.data == "premium_overview":
 
-        stock = get_stock_count()
-
+        stock = get_stock_count(
+            "premium"
+        )
 
         await query.message.reply_text(
 
             "👀 PREMIUM ACCOUNT OVERVIEW\n\n"
 
-            "💎 Premium CPM Account\n"
+            "🚗 All real-money cars\n"
 
-            "✨ Premium features included\n"
+            "🎯 Special mission cars\n"
 
-            "📦 Account delivered automatically\n"
+            "🏠 All houses UNLOCKED\n"
 
-            "⚡ Instant delivery after payment\n\n"
+            "👕 All Premium & Clan outfits "
+            "UNLOCKED\n"
+
+            "👑 King Rank\n"
+
+            "🔫 W16 UNLOCKED\n"
+
+            "🪙 500K Coins\n"
+
+            "💵 50M Cash\n"
+
+            "💃 Premium Animations\n\n"
+
+            "⚡ Instant automatic delivery\n\n"
 
             f"📦 Available: {stock}\n"
 
@@ -733,7 +1130,8 @@ async def button_handler(update, context):
 
                         "💳 BUY FOR 500 ⭐",
 
-                        callback_data="buy_premium"
+                        callback_data=
+                        "buy_premium"
 
                     )
 
@@ -744,18 +1142,67 @@ async def button_handler(update, context):
         )
 
 
+    # =====================================================
+    # RESOURCES
+    # =====================================================
+
     elif query.data == "resources":
+
+        stock = get_stock_count(
+            "resources"
+        )
+
+        if stock <= 0:
+
+            await query.message.reply_text(
+
+                "❌ PREMIUM RESOURCES\n\n"
+                "📦 Currently out of stock."
+
+            )
+
+            return
+
 
         await query.message.reply_text(
 
             "⭐ PREMIUM RESOURCES\n\n"
 
-            "Price: 200 ⭐\n\n"
+            "🚗 All real-money cars\n"
 
-            "📦 Available: 0"
+            "👕 All Premium outfits\n\n"
+
+            "⚡ Instant automatic delivery\n\n"
+
+            f"📦 Available: {stock}\n"
+
+            "💰 Price: 200 ⭐\n\n"
+
+            "Ready to purchase?",
+
+            reply_markup=InlineKeyboardMarkup([
+
+                [
+
+                    InlineKeyboardButton(
+
+                        "💳 BUY FOR 200 ⭐",
+
+                        callback_data=
+                        "buy_resources"
+
+                    )
+
+                ]
+
+            ]),
 
         )
 
+
+    # =====================================================
+    # SUPPORT
+    # =====================================================
 
     elif query.data == "support":
 
@@ -763,23 +1210,46 @@ async def button_handler(update, context):
 
             "❤️ SUPPORT\n\n"
 
-            "Need help with your order?\n\n"
+            "Support payment: 10 ⭐\n\n"
 
-            "👤 @OTTOCPM"
+            "Your support is greatly appreciated. 🙏",
+
+            reply_markup=InlineKeyboardMarkup([
+
+                [
+
+                    InlineKeyboardButton(
+
+                        "❤️ SUPPORT FOR 10 ⭐",
+
+                        callback_data=
+                        "buy_support"
+
+                    )
+
+                ]
+
+            ]),
 
         )
 
 
+    # =====================================================
+    # BUY PREMIUM
+    # =====================================================
+
     elif query.data == "buy_premium":
 
-        account = get_available_account()
-
+        account = get_available_account(
+            "premium"
+        )
 
         if account is None:
 
             await query.message.reply_text(
 
-                "❌ This product is currently out of stock."
+                "❌ Premium accounts "
+                "are currently out of stock."
 
             )
 
@@ -792,20 +1262,21 @@ async def button_handler(update, context):
 
             title="💎 Premium CPM Account",
 
-            description="Premium CPM Account",
+            description=(
+                "Premium CPM Account"
+            ),
 
-            payload=f"premium_{account[0]}",
+            payload=(
+                f"premium_{account[0]}"
+            ),
 
             currency="XTR",
 
             prices=[
 
                 LabeledPrice(
-
                     "Premium Account",
-
                     PREMIUM_PRICE
-
                 )
 
             ],
@@ -813,18 +1284,127 @@ async def button_handler(update, context):
         )
 
 
-# =========================
-# PAYMENT
-# =========================
+    # =====================================================
+    # BUY RESOURCES
+    # =====================================================
 
-async def precheckout_callback(update, context):
+    elif query.data == "buy_resources":
+
+        account = get_available_account(
+            "resources"
+        )
+
+        if account is None:
+
+            await query.message.reply_text(
+
+                "❌ Premium Resources "
+                "are currently out of stock."
+
+            )
+
+            return
+
+
+        await context.bot.send_invoice(
+
+            chat_id=query.from_user.id,
+
+            title="⭐ Premium Resources",
+
+            description=(
+                "Premium Resources"
+            ),
+
+            payload=(
+                f"resources_{account[0]}"
+            ),
+
+            currency="XTR",
+
+            prices=[
+
+                LabeledPrice(
+                    "Premium Resources",
+                    RESOURCES_PRICE
+                )
+
+            ],
+
+        )
+
+
+    # =====================================================
+    # BUY SUPPORT
+    # =====================================================
+
+    elif query.data == "buy_support":
+
+        await context.bot.send_invoice(
+
+            chat_id=query.from_user.id,
+
+            title="❤️ Support",
+
+            description=(
+                "Support the Premium CPM Shop"
+            ),
+
+            payload="support_10",
+
+            currency="XTR",
+
+            prices=[
+
+                LabeledPrice(
+                    "Support",
+                    SUPPORT_PRICE
+                )
+
+            ],
+
+        )
+
+
+# =========================================================
+# PRE-CHECKOUT
+# =========================================================
+
+async def precheckout_callback(
+    update,
+    context
+):
 
     query = update.pre_checkout_query
 
+    payload = query.invoice_payload
 
-    if not query.invoice_payload.startswith("premium_"):
 
-        await query.answer(ok=False)
+    # -----------------------------------------------------
+    # SUPPORT
+    # -----------------------------------------------------
+
+    if payload == "support_10":
+
+        await query.answer(
+            ok=True
+        )
+
+        return
+
+
+    # -----------------------------------------------------
+    # ACCOUNT PRODUCTS
+    # -----------------------------------------------------
+
+    if not (
+        payload.startswith("premium_")
+        or payload.startswith("resources_")
+    ):
+
+        await query.answer(
+            ok=False
+        )
 
         return
 
@@ -832,61 +1412,146 @@ async def precheckout_callback(update, context):
     try:
 
         account_id = int(
-            query.invoice_payload.split("_")[1]
+            payload.split("_")[1]
         )
 
-    except (IndexError, ValueError):
+    except (
+        IndexError,
+        ValueError
+    ):
 
         await query.answer(
 
             ok=False,
 
-            error_message="Invalid account."
+            error_message=
+            "Invalid account."
 
         )
 
         return
 
 
-    account = get_account_by_id(account_id)
+    account = get_account_by_id(
+        account_id
+    )
 
 
-    if account is None or account[3]:
+    if account is None:
 
         await query.answer(
 
             ok=False,
 
-            error_message="This account is no longer available."
+            error_message=
+            "Account not found."
 
         )
 
         return
 
 
-    await query.answer(ok=True)
+    if account[3]:
+
+        await query.answer(
+
+            ok=False,
+
+            error_message=
+            "This account is already sold."
+
+        )
+
+        return
 
 
-async def successful_payment(update, context):
+    expected_product = (
+        "premium"
+        if payload.startswith("premium_")
+        else "resources"
+    )
+
+
+    if account[4] != expected_product:
+
+        await query.answer(
+
+            ok=False,
+
+            error_message=
+            "This account is not available "
+            "for this product."
+
+        )
+
+        return
+
+
+    await query.answer(
+        ok=True
+    )
+
+
+# =========================================================
+# SUCCESSFUL PAYMENT
+# =========================================================
+
+async def successful_payment(
+    update,
+    context
+):
 
     payment = update.message.successful_payment
 
+    payload = payment.invoice_payload
 
-    if not payment.invoice_payload.startswith("premium_"):
+
+    # =====================================================
+    # SUPPORT PAYMENT
+    # =====================================================
+
+    if payload == "support_10":
+
+        await update.message.reply_text(
+
+            "✅ SUPPORT PAYMENT SUCCESSFUL!\n\n"
+
+            "❤️ Thank you for supporting us!\n"
+
+            "Your support is greatly appreciated. 🙏"
+
+        )
+
+        return
+
+
+    # =====================================================
+    # ACCOUNT PAYMENT
+    # =====================================================
+
+    if not (
+        payload.startswith("premium_")
+        or payload.startswith("resources_")
+    ):
+
         return
 
 
     try:
 
         account_id = int(
-            payment.invoice_payload.split("_")[1]
+            payload.split("_")[1]
         )
 
-    except (IndexError, ValueError):
+    except (
+        IndexError,
+        ValueError
+    ):
 
         await update.message.reply_text(
 
-            "⚠️ Payment received, but order ID is invalid.\n"
+            "⚠️ Payment received, "
+            "but order ID is invalid.\n\n"
 
             "Please contact support."
 
@@ -908,9 +1573,9 @@ async def successful_payment(update, context):
 
         await update.message.reply_text(
 
-            "⚠️ Payment received, but this account "
-
-            "was already sold.\n\n"
+            "⚠️ Payment received, "
+            "but this account was "
+            "already sold.\n\n"
 
             "Please contact support."
 
@@ -919,18 +1584,34 @@ async def successful_payment(update, context):
         return
 
 
-    login, password = result
+    login, password, product_type = result
+
+
+    if product_type == "premium":
+
+        product_name = (
+            "💎 PREMIUM ACCOUNT"
+        )
+
+    else:
+
+        product_name = (
+            "⭐ PREMIUM RESOURCES"
+        )
 
 
     await update.message.reply_text(
 
         "✅ PAYMENT SUCCESSFUL!\n\n"
 
-        "💎 PREMIUM ACCOUNT\n\n"
+        f"{product_name}\n\n"
 
         f"👤 Login: `{login}`\n"
 
         f"🔐 Password: `{password}`\n\n"
+
+        "⚡ Your account has been "
+        "delivered automatically.\n\n"
 
         "❤️ Thank you for your purchase!",
 
@@ -939,9 +1620,9 @@ async def successful_payment(update, context):
     )
 
 
-# =========================
+# =========================================================
 # MAIN
-# =========================
+# =========================================================
 
 def main():
 
@@ -962,10 +1643,15 @@ def main():
     init_database()
 
 
-    app = Application.builder().token(
-        BOT_TOKEN
-    ).build()
+    app = (
+        Application
+        .builder()
+        .token(BOT_TOKEN)
+        .build()
+    )
 
+
+    # START
 
     app.add_handler(
         CommandHandler(
@@ -975,6 +1661,8 @@ def main():
     )
 
 
+    # OWNER COMMAND
+
     app.add_handler(
         CommandHandler(
             "owner",
@@ -983,13 +1671,33 @@ def main():
     )
 
 
+    # OWNER PANEL BUTTONS
+
     app.add_handler(
         CallbackQueryHandler(
-            owner_panel_callback,
-            pattern=r"^owner_"
+
+            owner_product_callback,
+
+            pattern=(
+                r"^add_product_"
+            )
+
         )
     )
 
+
+    app.add_handler(
+        CallbackQueryHandler(
+
+            owner_panel_callback,
+
+            pattern=r"^owner_"
+
+        )
+    )
+
+
+    # USER BUTTONS
 
     app.add_handler(
         CallbackQueryHandler(
@@ -998,13 +1706,21 @@ def main():
     )
 
 
+    # OWNER TEXT
+
     app.add_handler(
         MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
+
+            filters.TEXT
+            & ~filters.COMMAND,
+
             owner_text_handler
+
         )
     )
 
+
+    # PAYMENT
 
     app.add_handler(
         PreCheckoutQueryHandler(
@@ -1015,17 +1731,23 @@ def main():
 
     app.add_handler(
         MessageHandler(
+
             filters.SUCCESSFUL_PAYMENT,
+
             successful_payment
+
         )
     )
 
 
-    print("Bot is running...")
+    print(
+        "Bot is running..."
+    )
 
 
     app.run_polling()
 
 
 if __name__ == "__main__":
+
     main()
