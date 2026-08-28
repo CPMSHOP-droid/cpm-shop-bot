@@ -74,14 +74,12 @@ def init_database():
                 )
             """)
 
-            # Product type.
             cur.execute("""
                 ALTER TABLE premium_accounts
                 ADD COLUMN IF NOT EXISTS product_type TEXT
                 DEFAULT 'premium'
             """)
 
-            # Reservation system.
             cur.execute("""
                 ALTER TABLE premium_accounts
                 ADD COLUMN IF NOT EXISTS reserved_by BIGINT
@@ -92,7 +90,6 @@ def init_database():
                 ADD COLUMN IF NOT EXISTS reserved_until TIMESTAMP
             """)
 
-            # Existing accounts are Premium.
             cur.execute("""
                 UPDATE premium_accounts
                 SET product_type = 'premium'
@@ -614,7 +611,16 @@ def complete_account_order(
 
                 return None, "wrong_user"
 
-            # Lock account.
+            if account_id is None:
+
+                conn.rollback()
+
+                return None, "account_not_found"
+
+            # -------------------------------------------------
+            # LOCK ACCOUNT
+            # -------------------------------------------------
+
             cur.execute(
                 """
                 SELECT
@@ -622,7 +628,8 @@ def complete_account_order(
                     password,
                     sold,
                     product_type,
-                    reserved_by
+                    reserved_by,
+                    reserved_until
                 FROM premium_accounts
                 WHERE id = %s
                 FOR UPDATE
@@ -644,6 +651,7 @@ def complete_account_order(
                 sold,
                 product_type,
                 reserved_by,
+                reserved_until,
             ) = account
 
             if sold:
@@ -664,7 +672,19 @@ def complete_account_order(
 
                 return None, "reservation_lost"
 
-            # Mark account sold.
+            if (
+                reserved_until is None
+                or reserved_until <= __import__("datetime").datetime.now()
+            ):
+
+                conn.rollback()
+
+                return None, "reservation_expired"
+
+            # -------------------------------------------------
+            # MARK ACCOUNT SOLD
+            # -------------------------------------------------
+
             cur.execute(
                 """
                 UPDATE premium_accounts
@@ -674,7 +694,9 @@ def complete_account_order(
                     sold_at = CURRENT_TIMESTAMP,
                     reserved_by = NULL,
                     reserved_until = NULL
-                WHERE id = %s
+                WHERE
+                    id = %s
+                    AND sold = FALSE
                 """,
                 (
                     user_id,
@@ -682,7 +704,16 @@ def complete_account_order(
                 ),
             )
 
-            # Mark order paid.
+            if cur.rowcount != 1:
+
+                conn.rollback()
+
+                return None, "already_sold"
+
+            # -------------------------------------------------
+            # MARK ORDER PAID
+            # -------------------------------------------------
+
             cur.execute(
                 """
                 UPDATE orders
@@ -690,13 +721,21 @@ def complete_account_order(
                     status = 'paid',
                     telegram_payment_charge_id = %s,
                     paid_at = CURRENT_TIMESTAMP
-                WHERE id = %s
+                WHERE
+                    id = %s
+                    AND status = 'pending'
                 """,
                 (
                     charge_id,
                     order_id,
                 ),
             )
+
+            if cur.rowcount != 1:
+
+                conn.rollback()
+
+                return None, "order_update_failed"
 
         conn.commit()
 
@@ -705,6 +744,106 @@ def complete_account_order(
             "login": login,
             "password": password,
             "product_type": product_type,
+            "amount": amount,
+        }, "success"
+
+
+# =========================================================
+# COMPLETE SUPPORT ORDER
+# =========================================================
+
+def complete_support_order(
+    order_id,
+    user_id,
+    charge_id
+):
+
+    with get_connection() as conn:
+
+        with conn.cursor() as cur:
+
+            cur.execute(
+                """
+                SELECT
+                    id,
+                    order_type,
+                    user_id,
+                    amount,
+                    status
+                FROM orders
+                WHERE id = %s
+                FOR UPDATE
+                """,
+                (order_id,),
+            )
+
+            order = cur.fetchone()
+
+            if order is None:
+
+                conn.rollback()
+
+                return None, "order_not_found"
+
+            (
+                _id,
+                order_type,
+                order_user_id,
+                amount,
+                status,
+            ) = order
+
+            if status == "paid":
+
+                conn.rollback()
+
+                return None, "already_paid"
+
+            if order_user_id != user_id:
+
+                conn.rollback()
+
+                return None, "wrong_user"
+
+            if order_type != "support":
+
+                conn.rollback()
+
+                return None, "wrong_product"
+
+            if amount != SUPPORT_PRICE:
+
+                conn.rollback()
+
+                return None, "wrong_amount"
+
+            cur.execute(
+                """
+                UPDATE orders
+                SET
+                    status = 'paid',
+                    telegram_payment_charge_id = %s,
+                    paid_at = CURRENT_TIMESTAMP
+                WHERE
+                    id = %s
+                    AND status = 'pending'
+                """,
+                (
+                    charge_id,
+                    order_id,
+                ),
+            )
+
+            if cur.rowcount != 1:
+
+                conn.rollback()
+
+                return None, "order_update_failed"
+
+        conn.commit()
+
+        return {
+            "order_id": order_id,
             "amount": amount,
         }, "success"
 
@@ -764,6 +903,7 @@ def delete_account(account_id):
                 WHERE
                     id = %s
                     AND sold = FALSE
+                    AND reserved_by IS NULL
                 RETURNING id
                 """,
                 (account_id,),
@@ -792,7 +932,9 @@ def get_stock_accounts(product_type):
                 """
                 SELECT
                     id,
-                    login
+                    login,
+                    reserved_by,
+                    reserved_until
                 FROM premium_accounts
                 WHERE
                     sold = FALSE
@@ -955,6 +1097,42 @@ def owner_keyboard():
 
 
 # =========================================================
+# OWNER PANEL TEXT
+# =========================================================
+
+def owner_panel_text():
+
+    premium_stock = get_stock_count("premium")
+    resources_stock = get_stock_count("resources")
+
+    premium_sold = get_sold_count("premium")
+    resources_sold = get_sold_count("resources")
+
+    total_sold = (
+        premium_sold
+        + resources_sold
+    )
+
+    total_revenue, _, _, support_revenue = get_revenue()
+
+    return (
+        "👑 OWNER PANEL\n\n"
+
+        "💎 PREMIUM ACCOUNT\n"
+        f"📦 Stock: {premium_stock}\n"
+        f"✅ Sold: {premium_sold}\n\n"
+
+        "⭐ PREMIUM RESOURCES\n"
+        f"📦 Stock: {resources_stock}\n"
+        f"✅ Sold: {resources_sold}\n\n"
+
+        f"📊 Total sold: {total_sold}\n"
+        f"💰 Total revenue: {total_revenue} ⭐\n"
+        f"❤️ Support: {support_revenue} ⭐"
+    )
+
+
+# =========================================================
 # OWNER PANEL
 # =========================================================
 
@@ -968,39 +1146,11 @@ async def owner(update, context):
 
         return
 
-    premium_stock = get_stock_count("premium")
-    resources_stock = get_stock_count("resources")
-
-    premium_sold = get_sold_count("premium")
-    resources_sold = get_sold_count("resources")
-
-    total_sold = (
-        premium_sold
-        + resources_sold
-    )
-
-    total_revenue, _, _, support_revenue = (
-        get_revenue()
-    )
+    context.user_data.clear()
 
     await update.message.reply_text(
-
-        "👑 OWNER PANEL\n\n"
-
-        "💎 PREMIUM ACCOUNT\n"
-        f"📦 Stock: {premium_stock}\n"
-        f"✅ Sold: {premium_sold}\n\n"
-
-        "⭐ PREMIUM RESOURCES\n"
-        f"📦 Stock: {resources_stock}\n"
-        f"✅ Sold: {resources_sold}\n\n"
-
-        f"📊 Total sold: {total_sold}\n"
-        f"💰 Total revenue: {total_revenue} ⭐\n"
-        f"❤️ Support: {support_revenue} ⭐",
-
+        owner_panel_text(),
         reply_markup=owner_keyboard(),
-
     )
 
 
@@ -1022,7 +1172,6 @@ async def owner_panel_callback(
 
     data = query.data
 
-
     # =====================================================
     # ONE-TIME TEST PURCHASE
     # =====================================================
@@ -1031,7 +1180,6 @@ async def owner_panel_callback(
 
         user_id = query.from_user.id
 
-        # Already used?
         if test_already_used(user_id):
 
             await query.message.reply_text(
@@ -1048,8 +1196,6 @@ async def owner_panel_callback(
 
             return
 
-
-        # Find an available Premium account.
         account = get_test_account()
 
         if account is None:
@@ -1065,19 +1211,14 @@ async def owner_panel_callback(
 
             return
 
-
         account_id = account[0]
         login = account[1]
         password = account[2]
 
-
-        # Mark test as used.
-        # This does NOT sell the account.
         marked = mark_test_used(
             user_id,
             account_id
         )
-
 
         if not marked:
 
@@ -1088,7 +1229,6 @@ async def owner_panel_callback(
             )
 
             return
-
 
         await query.message.reply_text(
 
@@ -1116,50 +1256,18 @@ async def owner_panel_callback(
 
         return
 
-
     # =====================================================
     # REFRESH
     # =====================================================
 
     if data == "owner_refresh":
 
-        premium_stock = get_stock_count("premium")
-        resources_stock = get_stock_count("resources")
-
-        premium_sold = get_sold_count("premium")
-        resources_sold = get_sold_count("resources")
-
-        total_sold = (
-            premium_sold
-            + resources_sold
-        )
-
-        total_revenue, _, _, support_revenue = (
-            get_revenue()
-        )
-
         await query.edit_message_text(
-
-            "👑 OWNER PANEL\n\n"
-
-            "💎 PREMIUM ACCOUNT\n"
-            f"📦 Stock: {premium_stock}\n"
-            f"✅ Sold: {premium_sold}\n\n"
-
-            "⭐ PREMIUM RESOURCES\n"
-            f"📦 Stock: {resources_stock}\n"
-            f"✅ Sold: {resources_sold}\n\n"
-
-            f"📊 Total sold: {total_sold}\n"
-            f"💰 Total revenue: {total_revenue} ⭐\n"
-            f"❤️ Support: {support_revenue} ⭐",
-
+            owner_panel_text(),
             reply_markup=owner_keyboard(),
-
         )
 
         return
-
 
     # =====================================================
     # STOCK
@@ -1176,31 +1284,57 @@ async def owner_panel_callback(
 
         if premium:
 
-            for account_id, login in premium:
+            for (
+                account_id,
+                login,
+                reserved_by,
+                reserved_until,
+            ) in premium:
 
-                text += (
-                    f"🟢 #{account_id} — `{login}`\n"
-                )
+                if reserved_by:
+
+                    text += (
+                        f"🟡 #{account_id} — `{login}` "
+                        "(reserved)\n"
+                    )
+
+                else:
+
+                    text += (
+                        f"🟢 #{account_id} — `{login}`\n"
+                    )
 
         else:
 
             text += "❌ Empty\n"
-
 
         text += "\n⭐ PREMIUM RESOURCES\n"
 
         if resources:
 
-            for account_id, login in resources:
+            for (
+                account_id,
+                login,
+                reserved_by,
+                reserved_until,
+            ) in resources:
 
-                text += (
-                    f"🟢 #{account_id} — `{login}`\n"
-                )
+                if reserved_by:
+
+                    text += (
+                        f"🟡 #{account_id} — `{login}` "
+                        "(reserved)\n"
+                    )
+
+                else:
+
+                    text += (
+                        f"🟢 #{account_id} — `{login}`\n"
+                    )
 
         else:
 
             text += "❌ Empty\n"
-
 
         await query.message.reply_text(
             text,
@@ -1208,7 +1342,6 @@ async def owner_panel_callback(
         )
 
         return
-
 
     # =====================================================
     # STATISTICS
@@ -1279,7 +1412,6 @@ async def owner_panel_callback(
 
         return
 
-
     # =====================================================
     # SALES
     # =====================================================
@@ -1291,12 +1423,13 @@ async def owner_panel_callback(
         if not sales:
 
             await query.message.reply_text(
-                "📈 SALES\n\nNo sales yet."
+                "📈 SALES\n\n"
+                "❌ No completed sales yet."
             )
 
             return
 
-        text = "📈 LAST 10 SALES\n\n"
+        text = "📈 RECENT SALES\n\n"
 
         for (
             order_id,
@@ -1309,41 +1442,32 @@ async def owner_panel_callback(
 
             if order_type == "premium":
 
-                product_name = (
-                    "💎 Premium Account"
-                )
+                product = "💎 Premium"
 
             elif order_type == "resources":
 
-                product_name = (
-                    "⭐ Premium Resources"
-                )
+                product = "⭐ Resources"
 
             else:
 
-                product_name = (
-                    "❤️ Support"
-                )
+                product = "❤️ Support"
 
             text += (
-
-                f"{product_name}\n"
-                f"🧾 Order: #{order_id}\n"
-                f"💰 Amount: {amount} ⭐\n"
-                f"👤 User: `{user_id}`\n"
-
+                f"🧾 Order #{order_id}\n"
+                f"📦 {product}\n"
+                f"💰 {amount} ⭐\n"
+                f"👤 User: {user_id}\n"
             )
 
             if login:
 
-                text += (
-                    f"🔐 Login: `{login}`\n"
-                )
+                text += f"🔑 Login: `{login}`\n"
 
-            text += (
-                f"🕐 {paid_at}\n\n"
-            )
+            if paid_at:
 
+                text += f"🕐 {paid_at}\n"
+
+            text += "\n"
 
         await query.message.reply_text(
             text,
@@ -1351,7 +1475,6 @@ async def owner_panel_callback(
         )
 
         return
-
 
     # =====================================================
     # ADD ACCOUNT
@@ -1361,47 +1484,36 @@ async def owner_panel_callback(
 
         context.user_data.clear()
 
-        context.user_data[
-            "adding_account"
-        ] = True
+        context.user_data["adding_account"] = True
 
-        context.user_data[
-            "add_step"
-        ] = "product"
+        keyboard = InlineKeyboardMarkup([
+
+            [
+                InlineKeyboardButton(
+                    "💎 PREMIUM",
+                    callback_data="add_product_premium"
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    "⭐ RESOURCES",
+                    callback_data="add_product_resources"
+                )
+            ],
+
+        ])
 
         await query.message.reply_text(
 
             "➕ ADD ACCOUNT\n\n"
-            "Choose account type:",
+            "Select the product type:",
 
-            reply_markup=InlineKeyboardMarkup([
-
-                [
-
-                    InlineKeyboardButton(
-                        "💎 PREMIUM — 500 ⭐",
-                        callback_data=
-                        "add_product_premium"
-                    )
-
-                ],
-
-                [
-
-                    InlineKeyboardButton(
-                        "⭐ RESOURCES — 200 ⭐",
-                        callback_data=
-                        "add_product_resources"
-                    )
-
-                ],
-
-            ])
+            reply_markup=keyboard
 
         )
 
         return
-
 
     # =====================================================
     # DELETE ACCOUNT
@@ -1423,18 +1535,21 @@ async def owner_panel_callback(
 
             return
 
-
         text = (
             "🗑️ DELETE ACCOUNT\n\n"
             "Send the ID of the account to delete.\n\n"
         )
 
-
         if premium:
 
             text += "💎 PREMIUM\n"
 
-            for account_id, login in premium:
+            for (
+                account_id,
+                login,
+                reserved_by,
+                reserved_until,
+            ) in premium:
 
                 text += (
                     f"#{account_id} — `{login}`\n"
@@ -1442,24 +1557,26 @@ async def owner_panel_callback(
 
             text += "\n"
 
-
         if resources:
 
             text += "⭐ RESOURCES\n"
 
-            for account_id, login in resources:
+            for (
+                account_id,
+                login,
+                reserved_by,
+                reserved_until,
+            ) in resources:
 
                 text += (
                     f"#{account_id} — `{login}`\n"
                 )
-
 
         context.user_data.clear()
 
         context.user_data[
             "deleting_account"
         ] = True
-
 
         await query.message.reply_text(
             text,
@@ -1490,13 +1607,11 @@ async def owner_product_callback(
     ):
         return
 
-
     if query.data == "add_product_premium":
 
         context.user_data[
             "new_product"
         ] = "premium"
-
 
     elif query.data == "add_product_resources":
 
@@ -1504,19 +1619,19 @@ async def owner_product_callback(
             "new_product"
         ] = "resources"
 
-
     else:
 
         return
 
-
     context.user_data[
-        "add_step"
-    ] = "login"
-
+        "waiting_account_login"
+    ] = True
 
     await query.message.reply_text(
-        "👤 Send the account LOGIN:"
+
+        "➕ ADD ACCOUNT\n\n"
+        "Send the account login/email:"
+
     )
 
 
@@ -1534,91 +1649,9 @@ async def owner_text_handler(
 
     text = update.message.text.strip()
 
-
-    # =====================================================
-    # ADD ACCOUNT
-    # =====================================================
-
-    if context.user_data.get(
-        "adding_account"
-    ):
-
-        step = context.user_data.get(
-            "add_step"
-        )
-
-
-        if step == "login":
-
-            context.user_data[
-                "new_login"
-            ] = text
-
-            context.user_data[
-                "add_step"
-            ] = "password"
-
-            await update.message.reply_text(
-                "🔐 Send the account PASSWORD:"
-            )
-
-            return
-
-
-        if step == "password":
-
-            login = context.user_data[
-                "new_login"
-            ]
-
-            password = text
-
-            product = context.user_data[
-                "new_product"
-            ]
-
-            account_id = add_account(
-                login,
-                password,
-                product
-            )
-
-            context.user_data.clear()
-
-
-            if product == "premium":
-
-                product_name = (
-                    "💎 Premium Account"
-                )
-
-            else:
-
-                product_name = (
-                    "⭐ Premium Resources"
-                )
-
-
-            await update.message.reply_text(
-
-                "✅ ACCOUNT ADDED!\n\n"
-
-                f"{product_name}\n"
-                f"🆔 ID: #{account_id}\n"
-                f"👤 Login: `{login}`\n"
-                f"📦 Current stock: "
-                f"{get_stock_count(product)}",
-
-                parse_mode="Markdown"
-
-            )
-
-            return
-
-
-    # =====================================================
+    # -----------------------------------------------------
     # DELETE ACCOUNT
-    # =====================================================
+    # -----------------------------------------------------
 
     if context.user_data.get(
         "deleting_account"
@@ -1636,25 +1669,22 @@ async def owner_text_handler(
 
             return
 
-
         result = delete_account(
             account_id
         )
 
         context.user_data.clear()
 
-
         if result is None:
 
             await update.message.reply_text(
 
-                "❌ Account not found "
-                "or already sold."
+                "❌ Account not found, already sold, "
+                "or currently reserved."
 
             )
 
             return
-
 
         await update.message.reply_text(
 
@@ -1662,6 +1692,95 @@ async def owner_text_handler(
             "deleted successfully."
 
         )
+
+        return
+
+    # -----------------------------------------------------
+    # ADD ACCOUNT — LOGIN
+    # -----------------------------------------------------
+
+    if context.user_data.get(
+        "waiting_account_login"
+    ):
+
+        context.user_data[
+            "new_login"
+        ] = text
+
+        context.user_data[
+            "waiting_account_login"
+        ] = False
+
+        context.user_data[
+            "waiting_account_password"
+        ] = True
+
+        await update.message.reply_text(
+
+            "🔐 Now send the account password:"
+
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # ADD ACCOUNT — PASSWORD
+    # -----------------------------------------------------
+
+    if context.user_data.get(
+        "waiting_account_password"
+    ):
+
+        login = context.user_data.get(
+            "new_login"
+        )
+
+        product_type = context.user_data.get(
+            "new_product"
+        )
+
+        password = text
+
+        if not login or not product_type:
+
+            context.user_data.clear()
+
+            await update.message.reply_text(
+                "❌ Add-account session expired."
+            )
+
+            return
+
+        account_id = add_account(
+            login,
+            password,
+            product_type
+        )
+
+        context.user_data.clear()
+
+        if product_type == "premium":
+
+            product_name = "💎 PREMIUM"
+
+        else:
+
+            product_name = "⭐ RESOURCES"
+
+        await update.message.reply_text(
+
+            "✅ ACCOUNT ADDED\n\n"
+
+            f"🧾 ID: #{account_id}\n"
+            f"📦 Product: {product_name}\n"
+            f"👤 Login: `{login}`\n"
+            "🔐 Password: saved securely in database.",
+
+            parse_mode="Markdown"
+
+        )
+
+        return
 
 
 # =========================================================
@@ -1701,7 +1820,6 @@ async def start(update, context):
 
     ]
 
-
     await update.message.reply_text(
 
         "👋 WELCOME TO PREMIUM CPM SHOP 🏎️\n\n"
@@ -1712,6 +1830,65 @@ async def start(update, context):
             keyboard
         ),
 
+    )
+
+
+# =========================================================
+# PRODUCT OVERVIEW
+# =========================================================
+
+def premium_overview():
+
+    return (
+        "💎 PREMIUM ACCOUNT — 500 ⭐\n\n"
+
+        "⚡ Premium CPM account\n"
+        "🔑 Login + password included\n"
+        "📦 Instant automatic delivery\n"
+        "🔐 Secure account reservation\n"
+        "⏱️ Account is reserved for 30 minutes "
+        "during checkout\n\n"
+
+        "💰 Price: 500 ⭐\n\n"
+
+        "⚠️ Please purchase only if you understand "
+        "that game developers, servers, APIs, "
+        "features or access conditions may change."
+    )
+
+
+def resources_overview():
+
+    return (
+        "⭐ PREMIUM RESOURCES — 200 ⭐\n\n"
+
+        "📦 Premium resources package\n"
+        "🔑 Login + password included\n"
+        "⚡ Instant automatic delivery\n"
+        "🔐 Secure account reservation\n"
+        "⏱️ Account is reserved for 30 minutes "
+        "during checkout\n\n"
+
+        "💰 Price: 200 ⭐\n\n"
+
+        "⚠️ Please purchase only if you understand "
+        "that game developers, servers, APIs, "
+        "features or access conditions may change."
+    )
+
+
+def support_overview():
+
+    return (
+        "❤️ SUPPORT\n\n"
+
+        "Support the development of the bot "
+        "and its services.\n\n"
+
+        "💰 Amount: 10 ⭐\n\n"
+
+        "After payment you will receive a "
+        "thank-you message."
     )
 
 
@@ -1728,6 +1905,7 @@ async def button_handler(
 
     await query.answer()
 
+    user_id = query.from_user.id
 
     # =====================================================
     # PREMIUM
@@ -1737,96 +1915,45 @@ async def button_handler(
 
         stock = get_stock_count("premium")
 
-
         if stock <= 0:
 
             await query.message.reply_text(
 
-                "❌ PREMIUM ACCOUNT\n\n"
-                "📦 Currently out of stock."
+                "💎 PREMIUM ACCOUNT\n\n"
+
+                "❌ Currently out of stock."
 
             )
 
             return
 
+        keyboard = InlineKeyboardMarkup([
+
+            [
+                InlineKeyboardButton(
+                    "💳 BUY FOR 500 ⭐",
+                    callback_data="buy_premium"
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    "⬅️ BACK",
+                    callback_data="back_start"
+                )
+            ],
+
+        ])
 
         await query.message.reply_text(
 
-            "💎 PREMIUM ACCOUNT\n\n"
+            premium_overview(),
 
-            "Price: 500 ⭐\n\n"
-
-            f"📦 Available: {stock}\n\n"
-
-            "Tap below to see what's included.",
-
-            reply_markup=InlineKeyboardMarkup([
-
-                [
-
-                    InlineKeyboardButton(
-                        "👀 PREMIUM ACCOUNT OVERVIEW",
-                        callback_data=
-                        "premium_overview"
-                    )
-
-                ]
-
-            ]),
+            reply_markup=keyboard
 
         )
 
         return
-
-
-    # =====================================================
-    # PREMIUM OVERVIEW
-    # =====================================================
-
-    if query.data == "premium_overview":
-
-        stock = get_stock_count("premium")
-
-
-        await query.message.reply_text(
-
-            "👀 PREMIUM ACCOUNT OVERVIEW\n\n"
-
-            "🚗 All real-money cars\n"
-            "🎯 Cars obtained from special missions\n"
-            "🏠 All houses UNLOCKED\n"
-            "👕 All Premium & Clan outfits UNLOCKED\n"
-            "👑 King Rank\n"
-            "🔫 W16 UNLOCKED\n"
-            "🪙 500K Coins\n"
-            "💵 50M Cash\n"
-            "💃 Premium Animations\n\n"
-
-            "⚡ Instant automatic delivery\n\n"
-
-            f"📦 Available: {stock}\n"
-            "💰 Price: 500 ⭐\n\n"
-
-            "Ready to purchase?",
-
-            reply_markup=InlineKeyboardMarkup([
-
-                [
-
-                    InlineKeyboardButton(
-                        "💳 BUY FOR 500 ⭐",
-                        callback_data=
-                        "buy_premium"
-                    )
-
-                ]
-
-            ]),
-
-        )
-
-        return
-
 
     # =====================================================
     # RESOURCES
@@ -1836,51 +1963,45 @@ async def button_handler(
 
         stock = get_stock_count("resources")
 
-
         if stock <= 0:
 
             await query.message.reply_text(
 
-                "❌ PREMIUM RESOURCES\n\n"
-                "📦 Currently out of stock."
+                "⭐ PREMIUM RESOURCES\n\n"
+
+                "❌ Currently out of stock."
 
             )
 
             return
 
+        keyboard = InlineKeyboardMarkup([
+
+            [
+                InlineKeyboardButton(
+                    "💳 BUY FOR 200 ⭐",
+                    callback_data="buy_resources"
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    "⬅️ BACK",
+                    callback_data="back_start"
+                )
+            ],
+
+        ])
 
         await query.message.reply_text(
 
-            "⭐ PREMIUM RESOURCES\n\n"
+            resources_overview(),
 
-            "🚗 All real-money cars\n"
-            "👕 All Premium outfits\n\n"
-
-            "⚡ Instant automatic delivery\n\n"
-
-            f"📦 Available: {stock}\n"
-            "💰 Price: 200 ⭐\n\n"
-
-            "Ready to purchase?",
-
-            reply_markup=InlineKeyboardMarkup([
-
-                [
-
-                    InlineKeyboardButton(
-                        "💳 BUY FOR 200 ⭐",
-                        callback_data=
-                        "buy_resources"
-                    )
-
-                ]
-
-            ]),
+            reply_markup=keyboard
 
         )
 
         return
-
 
     # =====================================================
     # SUPPORT
@@ -1888,32 +2009,77 @@ async def button_handler(
 
     if query.data == "support":
 
+        keyboard = InlineKeyboardMarkup([
+
+            [
+                InlineKeyboardButton(
+                    "❤️ SUPPORT — 10 ⭐",
+                    callback_data="buy_support"
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    "⬅️ BACK",
+                    callback_data="back_start"
+                )
+            ],
+
+        ])
+
         await query.message.reply_text(
 
-            "❤️ SUPPORT\n\n"
+            support_overview(),
 
-            "Support payment: 10 ⭐\n\n"
-
-            "Your support is greatly appreciated. 🙏",
-
-            reply_markup=InlineKeyboardMarkup([
-
-                [
-
-                    InlineKeyboardButton(
-                        "❤️ SUPPORT FOR 10 ⭐",
-                        callback_data=
-                        "buy_support"
-                    )
-
-                ]
-
-            ]),
+            reply_markup=keyboard
 
         )
 
         return
 
+    # =====================================================
+    # BACK
+    # =====================================================
+
+    if query.data == "back_start":
+
+        keyboard = [
+
+            [
+                InlineKeyboardButton(
+                    "💎 PREMIUM — 500 ⭐",
+                    callback_data="premium"
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    "⭐ PREMIUM RESOURCES — 200 ⭐",
+                    callback_data="resources"
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    "❤️ SUPPORT — 10 ⭐",
+                    callback_data="support"
+                )
+            ],
+
+        ]
+
+        await query.message.reply_text(
+
+            "👋 WELCOME TO PREMIUM CPM SHOP 🏎️\n\n"
+            "Choose the product you want to purchase:",
+
+            reply_markup=InlineKeyboardMarkup(
+                keyboard
+            )
+
+        )
+
+        return
 
     # =====================================================
     # BUY PREMIUM
@@ -1921,69 +2087,61 @@ async def button_handler(
 
     if query.data == "buy_premium":
 
-        user_id = query.from_user.id
-
-
         account = reserve_account(
             "premium",
             user_id
         )
 
-
         if account is None:
 
             await query.message.reply_text(
 
-                "❌ Premium accounts "
-                "are currently out of stock."
+                "❌ This product is currently "
+                "out of stock.\n\n"
+                "Please try again later."
 
             )
 
             return
 
-
         account_id = account[0]
 
-
         order_id = create_order(
-
             "premium",
             account_id,
             user_id,
             PREMIUM_PRICE
-
         )
 
+        payload = f"order_{order_id}"
+
+        prices = [
+            LabeledPrice(
+                "💎 Premium Account",
+                PREMIUM_PRICE
+            )
+        ]
 
         await context.bot.send_invoice(
 
             chat_id=user_id,
 
-            title="💎 Premium CPM Account",
+            title="💎 Premium Account",
 
             description=(
-                "Premium CPM Account"
+                "Premium account with "
+                "instant automatic delivery."
             ),
 
-            payload=(
-                f"order_{order_id}"
-            ),
+            payload=payload,
 
             currency="XTR",
 
-            prices=[
-
-                LabeledPrice(
-                    "Premium Account",
-                    PREMIUM_PRICE
-                )
-
-            ],
+            prices=prices,
 
         )
 
         return
-
 
     # =====================================================
     # BUY RESOURCES
@@ -1991,14 +2149,10 @@ async def button_handler(
 
     if query.data == "buy_resources":
 
-        user_id = query.from_user.id
-
-
         account = reserve_account(
             "resources",
             user_id
         )
-
 
         if account is None:
 
@@ -2011,19 +2165,23 @@ async def button_handler(
 
             return
 
-
         account_id = account[0]
 
-
         order_id = create_order(
-
             "resources",
             account_id,
             user_id,
             RESOURCES_PRICE
-
         )
 
+        payload = f"order_{order_id}"
+
+        prices = [
+            LabeledPrice(
+                "⭐ Premium Resources",
+                RESOURCES_PRICE
+            )
+        ]
 
         await context.bot.send_invoice(
 
@@ -2032,28 +2190,19 @@ async def button_handler(
             title="⭐ Premium Resources",
 
             description=(
-                "Premium Resources"
+                "Premium resources with "
+                "instant automatic delivery."
             ),
 
-            payload=(
-                f"order_{order_id}"
-            ),
+            payload=payload,
 
             currency="XTR",
 
-            prices=[
-
-                LabeledPrice(
-                    "Premium Resources",
-                    RESOURCES_PRICE
-                )
-
-            ],
+            prices=prices,
 
         )
 
         return
-
 
     # =====================================================
     # BUY SUPPORT
@@ -2061,18 +2210,21 @@ async def button_handler(
 
     if query.data == "buy_support":
 
-        user_id = query.from_user.id
-
-
         order_id = create_order(
-
             "support",
             None,
             user_id,
             SUPPORT_PRICE
-
         )
 
+        payload = f"order_{order_id}"
+
+        prices = [
+            LabeledPrice(
+                "❤️ Support",
+                SUPPORT_PRICE
+            )
+        ]
 
         await context.bot.send_invoice(
 
@@ -2081,25 +2233,19 @@ async def button_handler(
             title="❤️ Support",
 
             description=(
-                "Support the Premium CPM Shop"
+                "Support the development "
+                "of the service."
             ),
 
-            payload=(
-                f"order_{order_id}"
-            ),
+            payload=payload,
 
             currency="XTR",
 
-            prices=[
-
-                LabeledPrice(
-                    "Support",
-                    SUPPORT_PRICE
-                )
-
-            ],
+            prices=prices,
 
         )
+
+        return
 
 
 # =========================================================
@@ -2115,57 +2261,40 @@ async def precheckout_callback(
 
     payload = query.invoice_payload
 
-
     if not payload.startswith("order_"):
 
         await query.answer(
-
             ok=False,
-
             error_message="Invalid order."
-
         )
 
         return
-
 
     try:
 
         order_id = int(
-            payload.split("_")[1]
+            payload.replace("order_", "", 1)
         )
 
-    except (
-        IndexError,
-        ValueError
-    ):
+    except ValueError:
 
         await query.answer(
-
             ok=False,
-
-            error_message="Invalid order."
-
+            error_message="Invalid order ID."
         )
 
         return
 
-
     order = get_order(order_id)
-
 
     if order is None:
 
         await query.answer(
-
             ok=False,
-
             error_message="Order not found."
-
         )
 
         return
-
 
     (
         _id,
@@ -2176,32 +2305,23 @@ async def precheckout_callback(
         status,
     ) = order
 
-
     if status == "paid":
 
         await query.answer(
-
             ok=False,
-
             error_message="Order already paid."
-
         )
 
         return
-
 
     if user_id != query.from_user.id:
 
         await query.answer(
-
             ok=False,
-
             error_message="This order belongs to another user."
-
         )
 
         return
-
 
     # =====================================================
     # SUPPORT
@@ -2212,42 +2332,62 @@ async def precheckout_callback(
         if amount != SUPPORT_PRICE:
 
             await query.answer(
-
                 ok=False,
-
                 error_message="Invalid payment amount."
-
             )
 
             return
 
+        if query.currency != "XTR":
+
+            await query.answer(
+                ok=False,
+                error_message="Invalid currency."
+            )
+
+            return
+
+        if query.total_amount != SUPPORT_PRICE:
+
+            await query.answer(
+                ok=False,
+                error_message="Invalid payment amount."
+            )
+
+            return
 
         await query.answer(ok=True)
 
         return
 
+    # =====================================================
+    # ACCOUNT ORDER
+    # =====================================================
 
-    # =====================================================
-    # ACCOUNT
-    # =====================================================
+    if order_type not in (
+        "premium",
+        "resources"
+    ):
+
+        await query.answer(
+            ok=False,
+            error_message="Invalid product."
+        )
+
+        return
 
     account = get_account_by_id(
         account_id
     )
 
-
     if account is None:
 
         await query.answer(
-
             ok=False,
-
             error_message="Account not found."
-
         )
 
         return
-
 
     (
         _account_id,
@@ -2259,45 +2399,56 @@ async def precheckout_callback(
         reserved_until,
     ) = account
 
-
     if sold:
 
         await query.answer(
-
             ok=False,
-
             error_message="This account is already sold."
-
         )
 
         return
-
 
     if product_type != order_type:
 
         await query.answer(
-
             ok=False,
-
             error_message="Invalid product."
-
         )
 
         return
-
 
     if reserved_by != query.from_user.id:
 
         await query.answer(
-
             ok=False,
-
-            error_message="This account is no longer reserved for you."
-
+            error_message=(
+                "This account is no longer reserved for you."
+            )
         )
 
         return
 
+    if reserved_until is None:
+
+        await query.answer(
+            ok=False,
+            error_message="Account reservation expired."
+        )
+
+        return
+
+    from datetime import datetime
+
+    if reserved_until <= datetime.now():
+
+        clear_expired_reservations()
+
+        await query.answer(
+            ok=False,
+            error_message="Account reservation expired."
+        )
+
+        return
 
     if order_type == "premium":
 
@@ -2307,19 +2458,32 @@ async def precheckout_callback(
 
         expected_price = RESOURCES_PRICE
 
-
     if amount != expected_price:
 
         await query.answer(
-
             ok=False,
-
-            error_message="Invalid payment amount."
-
+            error_message="Invalid order amount."
         )
 
         return
 
+    if query.currency != "XTR":
+
+        await query.answer(
+            ok=False,
+            error_message="Invalid currency."
+        )
+
+        return
+
+    if query.total_amount != expected_price:
+
+        await query.answer(
+            ok=False,
+            error_message="Invalid payment amount."
+        )
+
+        return
 
     await query.answer(ok=True)
 
@@ -2337,41 +2501,29 @@ async def successful_payment(
 
     payload = payment.invoice_payload
 
-
     if not payload.startswith("order_"):
-        return
 
+        return
 
     try:
 
         order_id = int(
-            payload.split("_")[1]
+            payload.replace("order_", "", 1)
         )
 
-    except (
-        IndexError,
-        ValueError
-    ):
-
-        await update.message.reply_text(
-
-            "⚠️ Payment received, "
-            "but the order ID is invalid.\n\n"
-            "Please contact support."
-
-        )
+    except ValueError:
 
         return
 
+    user_id = update.effective_user.id
 
     order = get_order(order_id)
-
 
     if order is None:
 
         await update.message.reply_text(
 
-            "⚠️ Payment received, "
+            "⚠️ Payment was received, "
             "but the order could not be found.\n\n"
             "Please contact support."
 
@@ -2379,52 +2531,70 @@ async def successful_payment(
 
         return
 
+    (
+        _id,
+        order_type,
+        account_id,
+        order_user_id,
+        amount,
+        status,
+    ) = order
 
-    order_type = order[1]
+    if order_user_id != user_id:
 
+        await update.message.reply_text(
+
+            "⚠️ Payment received, "
+            "but the order user does not match.\n\n"
+            "Please contact support."
+
+        )
+
+        return
 
     # =====================================================
-    # SUPPORT
+    # SUPPORT PAYMENT
     # =====================================================
 
     if order_type == "support":
 
-        with get_connection() as conn:
+        result, result_status = complete_support_order(
+            order_id,
+            user_id,
+            payment.telegram_payment_charge_id
+        )
 
-            with conn.cursor() as cur:
+        if result is None:
 
-                cur.execute(
-                    """
-                    UPDATE orders
-                    SET
-                        status = 'paid',
-                        telegram_payment_charge_id = %s,
-                        paid_at = CURRENT_TIMESTAMP
-                    WHERE
-                        id = %s
-                        AND status != 'paid'
-                    """,
-                    (
-                        payment.telegram_payment_charge_id,
-                        order_id,
-                    ),
+            if result_status == "already_paid":
+
+                await update.message.reply_text(
+                    "⚠️ This order has already been completed."
                 )
 
-            conn.commit()
+            else:
 
+                await update.message.reply_text(
+
+                    "⚠️ Payment received, "
+                    "but the order could not be completed.\n\n"
+                    "Please contact support."
+
+                )
+
+            return
 
         await update.message.reply_text(
 
-            "✅ SUPPORT PAYMENT SUCCESSFUL!\n\n"
+            "❤️ THANK YOU!\n\n"
 
-            "❤️ Thank you for supporting us!\n\n"
+            "Your 10 ⭐ support payment "
+            "was received successfully.\n\n"
 
-            "Your support is greatly appreciated. 🙏"
+            "🙏 Thank you for supporting "
+            "the development of the bot!"
 
         )
-
-
-        # Owner notification.
 
         try:
 
@@ -2434,11 +2604,11 @@ async def successful_payment(
 
                 text=(
 
-                    "❤️ NEW SUPPORT PAYMENT\n\n"
+                    "❤️ NEW SUPPORT PAYMENT!\n\n"
 
                     f"🧾 Order: #{order_id}\n"
-                    f"💰 Amount: {SUPPORT_PRICE} ⭐\n"
-                    f"👤 User ID: {update.effective_user.id}\n\n"
+                    f"💰 Amount: {amount} ⭐\n"
+                    f"👤 User ID: {user_id}\n\n"
 
                     "✅ Payment successful."
 
@@ -2447,34 +2617,39 @@ async def successful_payment(
             )
 
         except Exception:
+
             pass
 
-
         return
-
 
     # =====================================================
     # ACCOUNT PAYMENT
     # =====================================================
 
-    result, status = complete_account_order(
-
+    result, result_status = complete_account_order(
         order_id,
-
-        update.effective_user.id,
-
+        user_id,
         payment.telegram_payment_charge_id
-
     )
-
 
     if result is None:
 
-        if status == "already_paid":
+        if result_status == "already_paid":
 
             await update.message.reply_text(
 
                 "⚠️ This order has already been completed."
+
+            )
+
+        elif result_status == "reservation_expired":
+
+            await update.message.reply_text(
+
+                "⚠️ The account reservation expired "
+                "before delivery.\n\n"
+
+                "Please contact support."
 
             )
 
@@ -2491,25 +2666,18 @@ async def successful_payment(
 
         return
 
-
     login = result["login"]
     password = result["password"]
     product_type = result["product_type"]
     amount = result["amount"]
 
-
     if product_type == "premium":
 
-        product_name = (
-            "💎 PREMIUM ACCOUNT"
-        )
+        product_name = "💎 PREMIUM ACCOUNT"
 
     else:
 
-        product_name = (
-            "⭐ PREMIUM RESOURCES"
-        )
-
+        product_name = "⭐ PREMIUM RESOURCES"
 
     # =====================================================
     # CUSTOMER DELIVERY
@@ -2535,7 +2703,6 @@ async def successful_payment(
 
     )
 
-
     # =====================================================
     # OWNER SALE NOTIFICATION
     # =====================================================
@@ -2556,7 +2723,7 @@ async def successful_payment(
 
                 f"💰 Amount: {amount} ⭐\n"
 
-                f"👤 User ID: {update.effective_user.id}\n"
+                f"👤 User ID: {user_id}\n"
 
                 f"👤 Login: `{login}`\n\n"
 
@@ -2569,6 +2736,7 @@ async def successful_payment(
         )
 
     except Exception:
+
         pass
 
 
@@ -2584,17 +2752,27 @@ def main():
             "BOT_TOKEN is not set."
         )
 
-
     if not DATABASE_URL:
 
         raise RuntimeError(
             "DATABASE_URL is not set."
         )
 
+    if OWNER_ID == 0:
 
-    # Database automatically creates/migrates tables.
+        raise RuntimeError(
+            "OWNER_ID is not set."
+        )
+
+    # -----------------------------------------------------
+    # DATABASE
+    # -----------------------------------------------------
+
     init_database()
 
+    # -----------------------------------------------------
+    # APPLICATION
+    # -----------------------------------------------------
 
     app = (
         Application
@@ -2602,7 +2780,6 @@ def main():
         .token(BOT_TOKEN)
         .build()
     )
-
 
     # -----------------------------------------------------
     # START
@@ -2615,7 +2792,6 @@ def main():
         )
     )
 
-
     # -----------------------------------------------------
     # OWNER
     # -----------------------------------------------------
@@ -2626,7 +2802,6 @@ def main():
             owner
         )
     )
-
 
     # -----------------------------------------------------
     # OWNER PRODUCT SELECTION
@@ -2639,7 +2814,6 @@ def main():
         )
     )
 
-
     # -----------------------------------------------------
     # OWNER CALLBACKS
     # -----------------------------------------------------
@@ -2651,7 +2825,6 @@ def main():
         )
     )
 
-
     # -----------------------------------------------------
     # USER CALLBACKS
     # -----------------------------------------------------
@@ -2661,7 +2834,6 @@ def main():
             button_handler
         )
     )
-
 
     # -----------------------------------------------------
     # OWNER TEXT INPUT
@@ -2674,7 +2846,6 @@ def main():
         )
     )
 
-
     # -----------------------------------------------------
     # PRE-CHECKOUT
     # -----------------------------------------------------
@@ -2684,7 +2855,6 @@ def main():
             precheckout_callback
         )
     )
-
 
     # -----------------------------------------------------
     # SUCCESSFUL PAYMENT
@@ -2697,9 +2867,7 @@ def main():
         )
     )
 
-
     print("Bot is running...")
-
 
     app.run_polling()
 
