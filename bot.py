@@ -497,29 +497,14 @@ async def button_handler(update, context):
 
     if query.data == "premium":
 
-        stock = get_stock_count()
+    # yeni Premium kodu
 
-        if stock <= 0:
-            await query.message.reply_text(
-                "❌ PREMIUM ACCOUNT\n\n"
-                "📦 Currently out of stock."
-            )
-            return
+elif query.data == "premium_overview":
 
-        await query.message.reply_text(
-            "💎 PREMIUM ACCOUNT\n\n"
-            "Price: 500 ⭐\n\n"
-            f"📦 Available: {stock}\n\n"
-            "Press the button below to purchase.",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "💳 BUY FOR 500 ⭐",
-                        callback_data="buy_premium"
-                    )
-                ]
-            ]),
-        )
+
+elif query.data == "resources":
+
+    # sənin köhnə Resources kodun
 
     elif query.data == "resources":
 
